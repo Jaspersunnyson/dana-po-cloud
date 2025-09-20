@@ -1,0 +1,145 @@
+name: PO Review (Cloud)
+on:
+  repository_dispatch:
+    types: [po_review_request]
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Unzip pipeline
+        run: unzip -q dana_po_pipeline_turnkey.zip
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install --no-cache-dir -r dana_po_pipeline/requirements.txt
+
+      - name: Disable remote indexing
+        run: |
+          sed -i 's/if OpenSearch is None:/if True:/g' dana_po_pipeline/scripts/chunk_and_index.py
+          sed -i 's/if QdrantClient is None or SentenceTransformer is None:/if True:/g' dana_po_pipeline/scripts/chunk_and_index.py
+
+      - name: Pull inputs from R2
+        env:
+          ACCOUNT_ID: ${{ secrets.CLOUDFLARE_R2_ACCOUNT_ID }}
+          ACCESS_KEY_ID: ${{ secrets.CLOUDFLARE_R2_ACCESS_KEY_ID }}
+          SECRET_ACCESS_KEY: ${{ secrets.CLOUDFLARE_R2_SECRET_ACCESS_KEY }}
+        run: |
+          pip install boto3
+          python - <<'PY'
+import os, json, boto3
+payload = json.loads(os.environ.get('GITHUB_EVENT_CLIENT_PAYLOAD', '{}'))
+jobId = payload.get('jobId')
+toggles = payload.get('toggles', {})
+session = boto3.session.Session(
+    aws_access_key_id=os.environ['ACCESS_KEY_ID'],
+    aws_secret_access_key=os.environ['SECRET_ACCESS_KEY'],
+    region_name='auto'
+)
+s3 = session.client('s3', endpoint_url=f"https://{os.environ['ACCOUNT_ID']}.r2.cloudflarestorage.com")
+bucket="dana-po-artifacts"
+for name in ["po", "pi", "commission"]:
+    key = f"in/{jobId}/{name}"
+    try:
+        s3.download_file(bucket, key, name)
+    except Exception as e:
+        print(e)
+open("toggles.json", "w").write(json.dumps(toggles))
+open("JOB_ID", "w").write(jobId)
+PY
+
+      - name: Run pipeline
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          QDRANT_URL: ${{ secrets.QDRANT_URL }}
+          QDRANT_API_KEY: ${{ secrets.QDRANT_API_KEY }}
+          OPENSEARCH_URL: ${{ secrets.OPENSEARCH_URL }}
+          OPENSEARCH_USER: ${{ secrets.OPENSEARCH_USER }}
+          OPENSEARCH_PASS: ${{ secrets.OPENSEARCH_PASS }}
+        run: |
+          mkdir -p run inputs
+          # Move downloaded documents into inputs
+          if [ -f po ]; then mv po inputs/po.docx; fi
+          if [ -f pi ]; then mv pi inputs/pi.docx; fi
+          if [ -f commission ]; then mv commission inputs/commission.docx; fi
+          python dana_po_pipeline/scripts/normalize_and_partition.py --input inputs --output run/elements.json
+          python dana_po_pipeline/scripts/chunk_and_index.py --elements run/elements.json --child-output run/child_chunks.json --opensearch-index dummy --qdrant-collection dummy
+          python dana_po_pipeline/scripts/deterministic_checks.py --po inputs/po.docx --output run/deterministic.json
+          python dana_po_pipeline/scripts/retrieve_candidates.py --child-chunks run/child_chunks.json --requirements dana_po_pipeline/schemas/requirements_contract_main_IRR.json --output run/candidates.json
+          python - <<'PY'
+import os, json, requests, json as js
+from jsonschema import validate
+schema=js.load(open('dana_po_pipeline/schemas/structured_output_schema.json'))
+reqs=js.load(open('dana_po_pipeline/schemas/requirements_contract_main_IRR.json'))
+clauses={c['id']: c for c in reqs['clauses']}
+cands=js.load(open('run/candidates.json'))
+results={}
+for cid, cand_list in cands.items():
+    expected = clauses.get(cid, {}).get('expected', '')
+    candidate_text = cand_list[0]['text'] if cand_list else ''
+    prompt = f"Clause ID: {cid}\nExpected: {expected}\nCandidate: {candidate_text}\nReturn STRICT JSON matching the schema."
+    body = {
+        "model": "gpt-4o-mini",
+        "response_format": {"type": "json_schema", "json_schema": {"name": "ClauseVerdict", "schema": schema}},
+        "messages": [
+            {"role": "system", "content": "You are a contracts checker."},
+            {"role": "user", "content": prompt}
+        ]
+    }
+    r = requests.post(
+        "https://api.openai.com/v1/chat/completions",
+        headers={"Authorization": f"Bearer {os.environ['OPENAI_API_KEY']}", "Content-Type": "application/json"},
+        json=body, timeout=120
+    )
+    r.raise_for_status()
+    content = r.json()["choices"][0]["message"]["content"]
+    try:
+        obj = js.loads(content)
+        validate(instance=obj, schema=schema)
+    except Exception:
+        obj = {"status": "AMBIGUOUS", "expected": expected, "actual": "", "evidence": {"doc": "", "page": 0, "element_id": "", "excerpt": ""}, "fix": "", "severity": "MEDIUM"}
+    results[cid] = obj
+with open('run/llm_results.json', 'w', encoding='utf-8') as f:
+    js.dump(results, f, ensure_ascii=False, indent=2)
+PY
+          python dana_po_pipeline/scripts/judge.py --results run/llm_results.json --requirements dana_po_pipeline/schemas/requirements_contract_main_IRR.json --output run/judged.json
+          python dana_po_pipeline/scripts/report_builder.py --results run/judged.json --deterministic run/deterministic.json --output run/00_Review_Report.docx --issues-csv run/issues.csv --issues-json run/issues.json
+
+      - name: Push outputs to R2 and set status
+        env:
+          ACCOUNT_ID: ${{ secrets.CLOUDFLARE_R2_ACCOUNT_ID }}
+          ACCESS_KEY_ID: ${{ secrets.CLOUDFLARE_R2_ACCESS_KEY_ID }}
+          SECRET_ACCESS_KEY: ${{ secrets.CLOUDFLARE_R2_SECRET_ACCESS_KEY }}
+        run: |
+          pip install boto3
+          python - <<'PY'
+import os, json, boto3
+jobId = open('JOB_ID').read().strip()
+session = boto3.session.Session(
+    aws_access_key_id=os.environ['ACCESS_KEY_ID'],
+    aws_secret_access_key=os.environ['SECRET_ACCESS_KEY'],
+    region_name='auto'
+)
+s3 = session.client('s3', endpoint_url=f"https://{os.environ['ACCOUNT_ID']}.r2.cloudflarestorage.com")
+bucket = "dana-po-artifacts"
+for fn in ["00_Review_Report.docx", "issues.csv", "issues.json"]:
+    s3.upload_file(f"run/{fn}", bucket, f"out/{jobId}/{fn}")
+status = {
+    "status": "done",
+    "jobId": jobId,
+    "links": {
+        "report": f"https://pub-{os.environ['ACCOUNT_ID']}.r2.dev/dana-po-artifacts/out/{jobId}/00_Review_Report.docx",
+        "issues_csv": f"https://pub-{os.environ['ACCOUNT_ID']}.r2.dev/dana-po-artifacts/out/{jobId}/issues.csv",
+        "issues_json": f"https://pub-{os.environ['ACCOUNT_ID']}.r2.dev/dana-po-artifacts/out/{jobId}/issues.json"
+    }
+}
+s3.put_object(Bucket=bucket, Key=f"status/{jobId}.json", Body=json.dumps(status, ensure_ascii=False).encode('utf-8'), ContentType="application/json")
+PY
